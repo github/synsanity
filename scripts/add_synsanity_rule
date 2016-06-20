@@ -1,0 +1,62 @@
+#!/bin/sh -e
+#
+# This program is licensed under the MIT license. See LICENSE.MIT for details.
+
+CHAIN=$1
+CONDITION_NAME=$2
+INTERFACE=$3
+PORT=$4
+
+if [ -z $CHAIN ]
+then
+  echo "Chain must be specified."
+  exit 1
+fi
+
+if [ -z $CONDITION_NAME ]
+then
+  echo "Condition name must be specified."
+  exit 1
+fi
+
+if [ -z $INTERFACE ]
+then
+  echo "Interface must be specified."
+  exit 1
+fi
+
+if [ -z $PORT ]
+then
+  echo "Port must be specified."
+  exit 1
+fi
+
+# load all the modules before trying to add rules
+modprobe ipt_SYNSANITY
+modprobe xt_syncookies
+modprobe xt_condition
+
+# If our condition variable is set, don't track SYN packets - we'll use this
+# next as a match to trigger that synsanity should handle them. This prevents
+# conntrack from locking on a SYN flood.
+iptables -t raw -I PREROUTING -i $INTERFACE \
+	-p tcp -m tcp --tcp-flags SYN SYN --dport $PORT \
+	-m condition --condition $CONDITION_NAME \
+	-j CT --notrack
+
+# Trigger condition variable when the SYN queue on the LISTEN socket backing
+# this port hits a watermark of 90%
+iptables -t raw -I PREROUTING -i $INTERFACE \
+	-p tcp -m tcp --tcp-flags SYN SYN --dport $PORT \
+	-m condition ! --condition $CONDITION_NAME \
+	-m syncookies --syn-queue-level 90 \
+	-j CONDITION --condition $CONDITION_NAME
+
+# When the packet then makes it to the INPUT chain in the filter table, we
+# check again to see if the condition is set. If it is, we'll handle completely
+# using synsanity's mitigation rules. Otherwise, we fall back to normal
+# simplistic firewall rules.
+iptables -I $CHAIN -i $INTERFACE \
+	-p tcp -m tcp --dport $PORT \
+	-m condition --condition $CONDITION_NAME \
+	-j synsanity-mitigation

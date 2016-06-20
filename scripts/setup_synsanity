@@ -1,0 +1,79 @@
+#!/bin/sh -e
+#
+# This program is licensed under the MIT license. See LICENSE.MIT for details.
+
+WSCALE=10
+TCP_MSS=1436
+
+# make sure our modules are all available
+modprobe nf_synproxy_core
+modprobe nf_conntrack_ipv4
+modprobe ipt_SYNSANITY
+modprobe xt_syncookies
+modprobe xt_condition
+
+/sbin/sysctl -w net/netfilter/nf_conntrack_tcp_loose=1
+/sbin/sysctl -w net/ipv4/tcp_syncookies=1
+/sbin/sysctl -w net/ipv4/tcp_timestamps=1
+
+iptables -t raw -F PREROUTING
+iptables -N synsanity-mitigation || true
+iptables -F synsanity-mitigation
+
+# set up synsanity for each condition name, interface and port we require
+scripts/add_synsanity_rule INPUT synsanity-mitigation-80 eth0 80
+scripts/add_synsanity_rule INPUT synsanity-mitigation-443 eth0 443
+
+
+## Below are generic synsanity options that are used when mitigation enabled ##
+
+# Any valid packets for existing, tracked connections are accepted
+iptables -A synsanity-mitigation \
+	-m conntrack --ctstate ESTABLISHED,RELATED \
+	-j ACCEPT
+# Allow through RST packets since they don't hold LISTEN lock, and Azure had
+# issues if we didn't. don't care what the state is
+iptables -A synsanity-mitigation -p tcp -m tcp --tcp-flags RST RST -j ACCEPT
+
+# SYN packets will be handled by SYNSANITY completely if syncookies enabled
+iptables -A synsanity-mitigation \
+	-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN \
+	-m conntrack --ctstate UNTRACKED \
+	-j SYNSANITY --sack-perm --timestamp \
+		--wscale $WSCALE --mss $TCP_MSS
+# To be explicit, SYN packets that were UNTRACKED should always be handled by
+# SYNSANITY. If it falls through, drop it anyway.
+iptables -A synsanity-mitigation \
+	-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN \
+	-m conntrack --ctstate UNTRACKED \
+	-j DROP
+# SYN packets that were tracked (aka not UNTRACKED) should go to the kernel tcp
+# stack as per usual.
+iptables -A synsanity-mitigation \
+	-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN \
+	-j ACCEPT
+# All other packets containing SYN (including SYN-ACKs) are invalid.
+iptables -A synsanity-mitigation -p tcp -m tcp --tcp-flags SYN SYN -j DROP
+
+# at this point, SYNs are completely gone
+
+# ACK packets for new connections (responses to SYN-ACK) should be checked by
+# SYNSANITY, valid cookies will continue to the kernel, invalid cookies will
+# be dropped
+iptables -A synsanity-mitigation \
+	-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK ACK \
+	-m conntrack --ctstate INVALID,NEW \
+	-j SYNSANITY --sack-perm --timestamp \
+		--wscale $WSCALE --mss $TCP_MSS
+# If the ACK is creating a connection and SYNSANITY was fine with it, let it
+# through for the kernel tcp stack to handle.
+iptables -A synsanity-mitigation \
+	-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK ACK \
+	-m conntrack --ctstate INVALID,NEW \
+	-j ACCEPT
+
+# Drop invalid packets except for ACK packets (which SYNSANITY will allow
+# through, and should go to the kernel directly)
+iptables -A synsanity-mitigation \
+	-m conntrack --ctstate INVALID \
+	-p tcp -m tcp ! --tcp-flags ALL ACK  -j DROP
