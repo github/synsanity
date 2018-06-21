@@ -1,4 +1,8 @@
-# synsanity
+# synsanity - DEPRECATED
+
+This project has been deprecated. GitHub runs a Linux kernel with [lockless listen sockets](https://lwn.net/Articles/659199/) as of 2017.
+
+---
 
 synsanity is a netfilter (iptables) target for high performance lockless SYN cookies for SYN flood mitigation, as used in production at GitHub.
 
